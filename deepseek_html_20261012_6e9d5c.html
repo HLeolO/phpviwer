@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>Source Viewer — PHP leak scanner</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --edge:#30363d; --txt:#c9d1d9; --accent:#58a6ff; --ok:#3fb950; --bad:#f85149; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--bg); color:var(--txt); }
+  header { padding:14px 20px; border-bottom:1px solid var(--edge); display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  h1 { font-size:15px; margin:0; color:var(--accent); font-weight:600; letter-spacing:.5px; }
+  input[type=url] { flex:1; min-width:260px; padding:9px 12px; background:var(--panel); border:1px solid var(--edge); color:var(--txt); border-radius:6px; font-family:inherit; font-size:13px; }
+  input:focus { outline:none; border-color:var(--accent); }
+  button { padding:9px 16px; background:var(--accent); color:#0d1117; border:0; border-radius:6px; font-weight:600; cursor:pointer; font-family:inherit; font-size:13px; }
+  button:hover { filter:brightness(1.1); }
+  button.scan { background:var(--ok); }
+  button.ghost { background:transparent; color:var(--txt); border:1px solid var(--edge); }
+  main { display:grid; grid-template-columns:1fr 340px; height:calc(100vh - 61px); }
+  #viewer { overflow:auto; padding:16px 20px; }
+  #side { border-left:1px solid var(--edge); overflow:auto; padding:14px; background:var(--panel); }
+  pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:12.5px; line-height:1.55; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .dim { color:#6e7681; }
+  #side h2 { font-size:12px; text-transform:uppercase; letter-spacing:1px; color:#6e7681; margin:0 0 10px; }
+  .probe { display:flex; justify-content:space-between; padding:6px 8px; border-bottom:1px solid var(--edge); font-size:12px; }
+  .probe .st { font-weight:600; }
+  .status { font-size:11px; color:#6e7681; margin-left:auto; }
+  .banner { background:#1c2128; border:1px solid var(--edge); padding:8px 12px; font-size:11px; color:#6e7681; width:100%; border-radius:6px; margin-top:6px; }
+  .banner.ok { color:var(--ok); border-color:var(--ok); }
+  .banner.bad { color:var(--bad); border-color:var(--bad); }
+</style>
+</head>
+<body>
+<header>
+  <h1>SOURCE VIEWER</h1>
+  <input type="url" id="url" placeholder="https://exemplo.com/arquivo.php" value="https://">
+  <button onclick="fetchSource()">BUSCAR</button>
+  <button class="scan" onclick="scanLeaks()">SCAN LEAKS</button>
+  <span class="status" id="status">pronto</span>
+  <div class="banner" id="banner">backend: verificando...</div>
+</header>
+
+<main>
+  <div id="viewer"><pre id="out" class="dim">// cole uma URL e clica em BUSCAR</pre></div>
+  <div id="side">
+    <h2>Vazamentos PHP testados</h2>
+    <div id="probes"></div>
+  </div>
+</main>
+
+<script>
+const BACKEND = 'http://localhost:8787';
+
+const EXTENSOES_LEAK = [
+  '.phps', '.php~', '.php.bak', '.php.old', '.php.orig', '.php.save',
+  '.php.swp', '.php.txt', '.php.dist', '.php.example', '.php.1', '.php.2',
+  '.bak', '~', '.old',
+];
+
+const $ = id => document.getElementById(id);
+const setStatus = s => $('status').textContent = s;
+
+// --- checa se backend tá de pé ao carregar ---
+async function checarBackend() {
+  const b = $('banner');
+  try {
+    const r = await fetch(BACKEND + '/grab?u=' + encodeURIComponent('https://example.com'));
+    if (r.ok) {
+      b.textContent = 'backend: OK (' + BACKEND + ')';
+      b.className = 'banner ok';
+      return true;
+    }
+    throw new Error('HTTP ' + r.status);
+  } catch (e) {
+    b.textContent = 'backend OFFLINE — roda "node server.js" antes. (' + e.message + ')';
+    b.className = 'banner bad';
+    return false;
+  }
+}
+
+// --- fetch via backend ---
+async function pegar(url) {
+  const r = await fetch(BACKEND + '/grab?u=' + encodeURIComponent(url));
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({erro: 'HTTP ' + r.status}));
+    throw new Error(err.erro || ('HTTP ' + r.status));
+  }
+  const j = await r.json();
+  if (j.erro) throw new Error(j.erro);
+  return j; // { status, headers, texto }
+}
+
+async function fetchSource() {
+  const url = $('url').value.trim();
+  if (!url || url === 'https://') { setStatus('URL vazia'); return; }
+  setStatus('buscando...');
+  $('out').className = 'dim';
+  $('out').textContent = '// carregando ' + url + ' ...';
+  try {
+    const { status, headers, texto } = await pegar(url);
+    const hdrLines = Object.entries(headers).slice(0, 20).map(([k,v]) => k + ': ' + v).join('\n');
+    $('out').className = '';
+    $('out').textContent =
+      '// ===== STATUS: ' + status + ' =====\n' +
+      '// ===== HEADERS =====\n' + hdrLines + '\n\n' +
+      '// ===== BODY =====\n' + texto;
+    setStatus('ok — ' + texto.length + ' bytes');
+  } catch (e) {
+    $('out').className = 'bad';
+    $('out').textContent = '// FALHOU: ' + e.message + '\n// confere se "node server.js" tá rodando na porta 8787';
+    setStatus('erro');
+  }
+}
+
+function ehPhp(url) {
+  try { return /\.php(\?|$)/i.test(new URL(url).pathname); } catch { return false; }
+}
+function baseSemExt(url) { return url.replace(/(\.php)(\?.*)?$/i, ''); }
+
+async function scanLeaks() {
+  const url = $('url').value.trim();
+  if (!url) { setStatus('URL vazia'); return; }
+  if (!ehPhp(url)) { setStatus('a URL não termina em .php'); return; }
+  const base = baseSemExt(url);
+  const alvos = EXTENSOES_LEAK.map(ext => ({ ext, url: base + ext }));
+
+  const side = $('probes');
+  side.innerHTML = '';
+  const resultados = [];
+  alvos.forEach(a => {
+    const div = document.createElement('div');
+    div.className = 'probe';
+    div.innerHTML = `<span>${a.ext}</span><span class="st dim">...</span>`;
+    side.appendChild(div);
+    a.el = div.querySelector('.st');
+  });
+
+  setStatus('escaneando ' + alvos.length + ' extensões...');
+
+  const limite = 4;
+  let i = 0;
+  async function worker() {
+    while (i < alvos.length) {
+      const a = alvos[i++];
+      try {
+        const { status, texto } = await pegar(a.url);
+        const pareceCodigo = /<\?php|\$[a-zA-Z_]\w*\s*=|\bfunction\b|\bclass\b/.test(texto) && texto.length > 40;
+        if (status === 200 && pareceCodigo) {
+          a.el.textContent = 'VAZOU'; a.el.className = 'st ok';
+          resultados.push({ url:a.url, texto });
+        } else if (status === 200) { a.el.textContent = '200'; a.el.className = 'st'; }
+        else if (status === 403) { a.el.textContent = '403'; a.el.className = 'st bad'; }
+        else if (status === 404) { a.el.textContent = '404'; a.el.className = 'st dim'; }
+        else { a.el.textContent = String(status); a.el.className = 'st'; }
+      } catch (e) {
+        a.el.textContent = 'erro'; a.el.className = 'st bad';
+      }
+    }
+  }
+  await Promise.all(Array.from({length: limite}, worker));
+
+  setStatus(resultados.length + ' vazamento(s) encontrado(s)');
+  if (resultados.length) {
+    const v = resultados[0];
+    $('out').className = '';
+    $('out').textContent = '// ===== VAZAMENTO: ' + v.url + ' =====\n\n' + v.texto;
+  }
+}
+
+$('url').addEventListener('keydown', e => { if (e.key === 'Enter') fetchSource(); });
+window.addEventListener('DOMContentLoaded', checarBackend);
+</script>
+</body>
+</html>
